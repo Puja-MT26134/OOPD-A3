@@ -8,6 +8,12 @@
 #include <chrono>
 #include <iomanip>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <future>
+#include <memory>
 
 // All the settings of the simulation live here
 struct Params
@@ -379,10 +385,69 @@ void addCounts(Counts &a, const Counts &b)
     a.checksum += b.checksum;
 }
 
+
+// A pool of worker threads that run tasks which return Counts
+class ThreadPool {
+public:
+    // start numThreads workers (once)
+    ThreadPool(int numThreads) {
+        for (int i = 0; i < numThreads; i++) {
+            workers.push_back(std::thread([this]() { workerLoop(); }));
+        }
+    }
+
+    // tell the workers to stop, then wait for them
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stopping = true;
+        }
+        cv.notify_all();
+        for (std::thread& w : workers) {
+            w.join();
+        }
+    }
+
+    // add a task to the waiting list, get a future for its result
+    std::future<Counts> submit(std::function<Counts()> job) {
+        auto task = std::make_shared<std::packaged_task<Counts()>>(job);
+        std::future<Counts> result = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            tasks.push([task]() { (*task)(); });
+        }
+        cv.notify_one();   // wake up one sleeping worker
+        return result;
+    }
+
+private:
+    // what every worker does: wait for a task, run it, repeat
+    void workerLoop() {
+        while (true) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [this]() { return stopping || !tasks.empty(); });
+                if (stopping && tasks.empty()) return;
+                job = tasks.front();
+                tasks.pop();
+            }
+            job();   // run the task outside the lock
+        }
+    }
+
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stopping = false;
+};
+
+
 // Simulate one whole day and swap the grids
 Counts simulateDay(std::vector<Cell> &cur, std::vector<Cell> &next,
                    const Params &p, int day, double betaEff,
-                   const std::vector<Chunk> &chunks)
+                   const std::vector<Chunk> &chunks, ThreadPool& pool)
 {
     // P[k] = chance of infection with k infected neighbours
     double P[9];
@@ -425,6 +490,24 @@ Counts simulateDay(std::vector<Cell> &cur, std::vector<Cell> &next,
             addCounts(total, t);
         }
     }
+
+        else if (p.mode == "pool") {
+        std::vector<std::future<Counts>> futures;
+
+        // submit one task per chunk
+        for (size_t c = 0; c < chunks.size(); c++) {
+            futures.push_back(pool.submit([&, c]() {
+                return updateChunk(cur, next, p, day, P, chunks[c]);
+            }));
+        }
+
+        // wait for each task and add up its counts
+        for (std::future<Counts>& f : futures) {
+            Counts t = f.get();
+            addCounts(total, t);
+        }
+    }
+
     else
     {
         std::cout << "Unknown mode: " << p.mode << "\n";
@@ -476,12 +559,16 @@ int main(int argc, char *argv[])
     double betaEff = p.beta * p.mask;
 
     std::vector<Chunk> chunks = makeChunks(p);
+
+    // the pool is created once; it only has threads in "pool" mode
+    ThreadPool pool(p.mode == "pool" ? p.threads : 0);
+
     // Only this loop is timed
     auto start = std::chrono::steady_clock::now();
 
     for (int day = 0; day < p.days; day++)
     {
-        Counts t = simulateDay(cur, next, p, day, betaEff, chunks);
+        Counts t = simulateDay(cur, next, p, day, betaEff, chunks, pool);
 
         DayRow row;
         row.day = day;
