@@ -28,7 +28,7 @@ struct Params {
     bool useLockdown = false;  // lockdown on or off
         bool fixedDays = false;    // true = never stop early
     std::string outFile = "out.csv";
-    
+        std::string partition = "strips";   // strips, blocks or interleaved
 
 };
 
@@ -65,6 +65,7 @@ Params parseArgs(int argc, char* argv[]) {
         else if (flag == "--out") p.outFile = value;
         else if (flag == "--lockdown") p.useLockdown = (std::stoi(value) != 0);
                 else if (flag == "--fixed-days") p.fixedDays = (std::stoi(value) != 0);
+                        else if (flag == "--partition") p.partition = value;
         else {
             std::cout << "Unknown flag: " << flag << "\n";
             exit(1);
@@ -185,16 +186,74 @@ void countCell(Counts& t, int id, const Cell& cell) {
     t.checksum += mix(key);
 }
 
-// Update rows rowStart..rowEnd-1 of the grid for one day.
+// One piece of the grid that a task works on
+struct Chunk {
+    int rowStart, rowEnd, rowStep;
+    int colStart, colEnd;
+};
+
+// Divide the grid into chunks, using the scheme in p.partition
+std::vector<Chunk> makeChunks(const Params& p) {
+    std::vector<Chunk> chunks;
+    int N = p.N;
+    int C = p.chunks;
+    if (C < 1) C = 1;
+
+    if (p.partition == "strips") {
+        for (int c = 0; c < C; c++) {
+            Chunk ch;
+            ch.rowStart = c * N / C;
+            ch.rowEnd = (c + 1) * N / C;
+            ch.rowStep = 1;
+            ch.colStart = 0;
+            ch.colEnd = N;
+            chunks.push_back(ch);
+        }
+    }
+    else if (p.partition == "interleaved") {
+        for (int c = 0; c < C; c++) {
+            Chunk ch;
+            ch.rowStart = c;
+            ch.rowEnd = N;
+            ch.rowStep = C;
+            ch.colStart = 0;
+            ch.colEnd = N;
+            chunks.push_back(ch);
+        }
+    }
+    else if (p.partition == "blocks") {
+        // g x g blocks, where g*g is at least C
+        int g = (int)std::ceil(std::sqrt((double)C));
+        for (int bi = 0; bi < g; bi++) {
+            for (int bj = 0; bj < g; bj++) {
+                Chunk ch;
+                ch.rowStart = bi * N / g;
+                ch.rowEnd = (bi + 1) * N / g;
+                ch.rowStep = 1;
+                ch.colStart = bj * N / g;
+                ch.colEnd = (bj + 1) * N / g;
+                chunks.push_back(ch);
+            }
+        }
+    }
+    else {
+        std::cout << "Unknown partition: " << p.partition << "\n";
+        exit(1);
+    }
+    return chunks;
+}
+
+
+// Update one chunk of the grid for one day.
 // Reads from cur, writes only to next, returns counts of what it wrote.
-Counts updateRows(const std::vector<Cell>& cur, std::vector<Cell>& next,
-                  const Params& p, int day, const double P[9],
-                  int rowStart, int rowEnd) {
+Counts updateChunk(const std::vector<Cell>& cur, std::vector<Cell>& next,
+                   const Params& p, int day, const double P[9],
+                   const Chunk& ch) {
     Counts t;
     int N = p.N;
 
-    for (int i = rowStart; i < rowEnd; i++) {
-        for (int j = 0; j < N; j++) {
+    for (int i = ch.rowStart; i < ch.rowEnd; i += ch.rowStep) {
+        for (int j = ch.colStart; j < ch.colEnd; j++) {
             int id = i * N + j;
             Cell newCell = cur[id];   // by default, nothing changes
 
@@ -226,21 +285,6 @@ Counts updateRows(const std::vector<Cell>& cur, std::vector<Cell>& next,
     return t;
 }
 
-// Simulate one whole day and swap the grids
-Counts simulateDay(std::vector<Cell>& cur, std::vector<Cell>& next,
-                   const Params& p, int day, double betaEff) {
-    // P[k] = chance of infection with k infected neighbours
-    double P[9];
-    for (int k = 0; k <= 8; k++) {
-        P[k] = 1.0 - std::pow(1.0 - betaEff, k);
-    }
-
-    Counts t = updateRows(cur, next, p, day, P, 0, p.N);
-    cur.swap(next);   // tomorrow becomes today
-    return t;
-}
-
-
 // Add the counts of b into a
 void addCounts(Counts& a, const Counts& b) {
     a.s += b.s;
@@ -250,6 +294,27 @@ void addCounts(Counts& a, const Counts& b) {
     a.d += b.d;
     a.checksum += b.checksum;
 }
+
+// Simulate one whole day and swap the grids
+Counts simulateDay(std::vector<Cell>& cur, std::vector<Cell>& next,
+                   const Params& p, int day, double betaEff,
+                   const std::vector<Chunk>& chunks) {
+    // P[k] = chance of infection with k infected neighbours
+    double P[9];
+    for (int k = 0; k <= 8; k++) {
+        P[k] = 1.0 - std::pow(1.0 - betaEff, k);
+    }
+
+    Counts total;
+    for (const Chunk& ch : chunks) {
+        Counts t = updateChunk(cur, next, p, day, P, ch);
+        addCounts(total, t);
+    }
+    cur.swap(next);   // tomorrow becomes today
+    return total;
+}
+
+
 
 // Decide tomorrow's betaEff from today's totals.
 // 'lockdown' remembers whether a lockdown is active right now.
@@ -285,11 +350,13 @@ int main(int argc, char* argv[]) {
     bool lockdown = false;
     double betaEff = p.beta * p.mask;
 
+     std::vector<Chunk> chunks = makeChunks(p);
     // Only this loop is timed
     auto start = std::chrono::steady_clock::now();
+       
 
     for (int day = 0; day < p.days; day++) {
-        Counts t = simulateDay(cur, next, p, day, betaEff);
+        Counts t = simulateDay(cur, next, p, day, betaEff, chunks);
 
         DayRow row;
         row.day = day;
@@ -302,6 +369,7 @@ int main(int argc, char* argv[]) {
 
         // today's totals decide tomorrow's betaEff
         betaEff = nextBeta(p, t, lockdown);
+                
     }
 
     auto end = std::chrono::steady_clock::now();
