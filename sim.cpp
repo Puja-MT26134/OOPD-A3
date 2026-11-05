@@ -14,6 +14,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <filesystem>
 
 // All the settings of the simulation live here
 struct Params
@@ -36,8 +37,12 @@ struct Params
     bool useLockdown = false; // lockdown on or off
     bool fixedDays = false;   // true = never stop early
     std::string outFile = "out.csv";
-    std::string partition = "strips"; // strips, blocks or interleaved
-    std::string mode = "sequential";  // sequential, thread-per-day or pool
+    std::string partition = "strips";      // strips, blocks or interleaved
+    std::string mode = "sequential";       // sequential, thread-per-day or pool
+    std::string snapshotDir = "out/snaps"; // folder for the images
+    int ioLatency = 0;                     // extra delay per write, in ms
+        std::string snapshotMode = "blocking";   // blocking or async
+    int maxPending = 4;                      // Q: most writes allowed at once
 };
 
 Params parseArgs(int argc, char *argv[])
@@ -97,6 +102,12 @@ Params parseArgs(int argc, char *argv[])
             p.partition = value;
         else if (flag == "--mode")
             p.mode = value;
+        else if (flag == "--snapshot-dir")
+            p.snapshotDir = value;
+        else if (flag == "--io-latency")
+            p.ioLatency = std::stoi(value);
+                    else if (flag == "--snapshot-mode") p.snapshotMode = value;
+        else if (flag == "--max-pending") p.maxPending = std::stoi(value);
         else
         {
             std::cout << "Unknown flag: " << flag << "\n";
@@ -385,54 +396,65 @@ void addCounts(Counts &a, const Counts &b)
     a.checksum += b.checksum;
 }
 
-
 // A pool of worker threads that run tasks which return Counts
-class ThreadPool {
+class ThreadPool
+{
 public:
     // start numThreads workers (once)
-    ThreadPool(int numThreads) {
-        for (int i = 0; i < numThreads; i++) {
-            workers.push_back(std::thread([this]() { workerLoop(); }));
+    ThreadPool(int numThreads)
+    {
+        for (int i = 0; i < numThreads; i++)
+        {
+            workers.push_back(std::thread([this]()
+                                          { workerLoop(); }));
         }
     }
 
     // tell the workers to stop, then wait for them
-    ~ThreadPool() {
+    ~ThreadPool()
+    {
         {
             std::lock_guard<std::mutex> lock(mtx);
             stopping = true;
         }
         cv.notify_all();
-        for (std::thread& w : workers) {
+        for (std::thread &w : workers)
+        {
             w.join();
         }
     }
 
     // add a task to the waiting list, get a future for its result
-    std::future<Counts> submit(std::function<Counts()> job) {
+    std::future<Counts> submit(std::function<Counts()> job)
+    {
         auto task = std::make_shared<std::packaged_task<Counts()>>(job);
         std::future<Counts> result = task->get_future();
         {
             std::lock_guard<std::mutex> lock(mtx);
-            tasks.push([task]() { (*task)(); });
+            tasks.push([task]()
+                       { (*task)(); });
         }
-        cv.notify_one();   // wake up one sleeping worker
+        cv.notify_one(); // wake up one sleeping worker
         return result;
     }
 
 private:
     // what every worker does: wait for a task, run it, repeat
-    void workerLoop() {
-        while (true) {
+    void workerLoop()
+    {
+        while (true)
+        {
             std::function<void()> job;
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [this]() { return stopping || !tasks.empty(); });
-                if (stopping && tasks.empty()) return;
+                cv.wait(lock, [this]()
+                        { return stopping || !tasks.empty(); });
+                if (stopping && tasks.empty())
+                    return;
                 job = tasks.front();
                 tasks.pop();
             }
-            job();   // run the task outside the lock
+            job(); // run the task outside the lock
         }
     }
 
@@ -443,11 +465,10 @@ private:
     bool stopping = false;
 };
 
-
 // Simulate one whole day and swap the grids
 Counts simulateDay(std::vector<Cell> &cur, std::vector<Cell> &next,
                    const Params &p, int day, double betaEff,
-                   const std::vector<Chunk> &chunks, ThreadPool& pool)
+                   const std::vector<Chunk> &chunks, ThreadPool &pool)
 {
     // P[k] = chance of infection with k infected neighbours
     double P[9];
@@ -491,18 +512,20 @@ Counts simulateDay(std::vector<Cell> &cur, std::vector<Cell> &next,
         }
     }
 
-        else if (p.mode == "pool") {
+    else if (p.mode == "pool")
+    {
         std::vector<std::future<Counts>> futures;
 
         // submit one task per chunk
-        for (size_t c = 0; c < chunks.size(); c++) {
-            futures.push_back(pool.submit([&, c]() {
-                return updateChunk(cur, next, p, day, P, chunks[c]);
-            }));
+        for (size_t c = 0; c < chunks.size(); c++)
+        {
+            futures.push_back(pool.submit([&, c]()
+                                          { return updateChunk(cur, next, p, day, P, chunks[c]); }));
         }
 
         // wait for each task and add up its counts
-        for (std::future<Counts>& f : futures) {
+        for (std::future<Counts> &f : futures)
+        {
             Counts t = f.get();
             addCounts(total, t);
         }
@@ -545,6 +568,77 @@ struct DayRow
     double beta;
 };
 
+// Save the grid as a PPM image, one colour per state. Returns true if it worked.
+bool writePPM(const std::vector<Cell> &grid, int N,
+              const std::string &filename, int latencyMs)
+{
+    // imitate slow storage
+    if (latencyMs > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(latencyMs));
+    }
+
+    std::ofstream f(filename, std::ios::binary);
+    if (!f)
+        return false;
+
+    f << "P6\n"
+      << N << " " << N << "\n255\n";
+
+    std::vector<unsigned char> pixels(N * N * 3);
+    for (int id = 0; id < N * N; id++)
+    {
+        unsigned char red = 0, green = 0, blue = 0;
+        if (grid[id].state == S)
+        {
+            red = 60;
+            green = 160;
+            blue = 60;
+        } // green
+        else if (grid[id].state == I)
+        {
+            red = 220;
+            green = 30;
+            blue = 30;
+        } // red
+        else if (grid[id].state == R)
+        {
+            red = 50;
+            green = 90;
+            blue = 220;
+        } // blue
+        else if (grid[id].state == V)
+        {
+            red = 230;
+            green = 210;
+            blue = 40;
+        } // yellow
+        else
+        {
+            red = 20;
+            green = 20;
+            blue = 20;
+        } // dark (dead)
+        pixels[id * 3] = red;
+        pixels[id * 3 + 1] = green;
+        pixels[id * 3 + 2] = blue;
+    }
+    f.write((const char *)pixels.data(), pixels.size());
+    return f.good();
+}
+
+// Wait for the oldest pending write, count it if it failed, remove it
+void finishOne(std::deque<std::future<bool>>& pending, int& failedWrites) {
+    bool ok = false;
+    try {
+        ok = pending.front().get();
+    } catch (...) {
+        ok = false;
+    }
+    if (!ok) failedWrites++;
+    pending.pop_front();
+}
+
 int main(int argc, char *argv[])
 {
     Params p = parseArgs(argc, argv);
@@ -559,6 +653,20 @@ int main(int argc, char *argv[])
     double betaEff = p.beta * p.mask;
 
     std::vector<Chunk> chunks = makeChunks(p);
+
+    if (p.snapshotEvery > 0)
+    {
+        std::filesystem::create_directories(p.snapshotDir);
+    }
+    int failedWrites = 0;
+
+        std::deque<std::future<bool>> pending;   // writes running in the background
+    int Q = p.maxPending;
+    if (Q < 1) Q = 1;
+    if (p.snapshotMode != "blocking" && p.snapshotMode != "async") {
+        std::cout << "Unknown snapshot mode: " << p.snapshotMode << "\n";
+        return 1;
+    }
 
     // the pool is created once; it only has threads in "pool" mode
     ThreadPool pool(p.mode == "pool" ? p.threads : 0);
@@ -576,6 +684,39 @@ int main(int argc, char *argv[])
         row.beta = betaEff;
         rows.push_back(row);
 
+                // blocking snapshot: the simulation waits until the file is written
+        /*if (p.snapshotEvery > 0 && day % p.snapshotEvery == 0) {
+            std::string name = p.snapshotDir + "/snap_" + std::to_string(day) + ".ppm";
+            if (!writePPM(cur, p.N, name, p.ioLatency)) failedWrites++;
+        }*/
+
+                if (p.snapshotEvery > 0 && day % p.snapshotEvery == 0) {
+            std::string name = p.snapshotDir + "/snap_" + std::to_string(day) + ".ppm";
+
+            if (p.snapshotMode == "blocking") {
+                // the simulation waits until the file is written
+                if (!writePPM(cur, p.N, name, p.ioLatency)) failedWrites++;
+            }
+            else {
+                // 1. clear writes that have already finished
+                while (!pending.empty() &&
+                       pending.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    finishOne(pending, failedWrites);
+                }
+                // 2. if Q writes are still running, wait for the oldest
+                while (!pending.empty() && (int)pending.size() >= Q) {
+                    finishOne(pending, failedWrites);
+                }
+                // 3. copy the grid and write the copy in the background
+                auto copy = std::make_shared<std::vector<Cell>>(cur);
+                int N = p.N;
+                int latency = p.ioLatency;
+                pending.push_back(std::async(std::launch::async, [copy, N, name, latency]() {
+                    return writePPM(*copy, N, name, latency);
+                }));
+            }
+        }
+
         // stop when nobody is infected (unless fixed-days is on)
         if (!p.fixedDays && t.i == 0)
             break;
@@ -584,6 +725,11 @@ int main(int argc, char *argv[])
         betaEff = nextBeta(p, t, lockdown);
     }
 
+        // wait for all writes that are still running (this is part of the timed run)
+    while (!pending.empty()) {
+        finishOne(pending, failedWrites);
+    }
+    
     auto end = std::chrono::steady_clock::now();
     double seconds = std::chrono::duration<double>(end - start).count();
 
@@ -604,6 +750,8 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "Simulated " << rows.size() << " days in "
-              << seconds << " seconds\n";
+              << seconds << " seconds";
+              if(p.snapshotEvery > 0) std::cout << ", failed writes: " << failedWrites;
+              std::cout << "\n";
     return 0;
 }
